@@ -1,36 +1,32 @@
 package com.sonusid.localvpntunnel
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.IOException
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class LocalVpnService : VpnService() {
+
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var executorService: ExecutorService? = null
+    private val executorService: ExecutorService = Executors.newFixedThreadPool(4)
+    private var isRunning = false
+    
+    // Tracks active TCP sessions: Key is "SourcePort:DestIP:DestPort"
+    private val tcpSessions = ConcurrentHashMap<String, SocketChannel>()
 
     companion object {
-        private const val TAG = "LocalVpnService"
-        private const val CHANNEL_ID = "vpn_channel"
-        private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "com.sonusid.localvpntunnel.STOP"
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
+        private const val TAG = "LocalVpnService"
+        private const val MTU = 32767 // Increased MTU for better throughput
+        private const val GATEWAY_IP = "10.0.0.2"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -38,107 +34,122 @@ class LocalVpnService : VpnService() {
             stopVpn()
             return START_NOT_STICKY
         }
-        startVpn()
+
+        if (!isRunning) {
+            establishVpn()
+            isRunning = true
+            executorService.execute { runVpnLoop() }
+        }
         return START_STICKY
     }
 
-    private fun startVpn() {
-        if (vpnInterface != null) return
-
+    private fun establishVpn() {
         val builder = Builder()
-            .setSession("LocalVPNTunnel")
-            .addAddress("10.0.0.2", 24)
+        builder.setMtu(MTU)
+            .addAddress("10.0.0.1", 24)
+            // ONLY route the sandbox subnet to keep the rest of the internet fast!
+            .addRoute("10.0.0.0", 24) 
             .addDnsServer("8.8.8.8")
-            .addRoute("0.0.0.0", 0)
+            .setSession("TunnelCraft")
             .setBlocking(true)
 
-        try {
-            vpnInterface = builder.establish()
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to establish VPN", e)
-            stopSelf()
-            return
-        }
-
-        if (vpnInterface != null) {
-            startForeground(NOTIFICATION_ID, createNotification())
-            runVpnLoop()
-        }
+        vpnInterface = builder.establish()
+        Log.i(TAG, "VPN established. Split tunneling active for 10.0.0.0/24")
     }
 
     private fun runVpnLoop() {
-        executorService = Executors.newSingleThreadExecutor()
-        executorService?.execute {
-            val inputStream = FileInputStream(vpnInterface!!.fileDescriptor)
-            val outputStream = FileOutputStream(vpnInterface!!.fileDescriptor)
-            val packet = ByteBuffer.allocate(32767)
+        val input = FileInputStream(vpnInterface?.fileDescriptor)
+        val output = FileOutputStream(vpnInterface?.fileDescriptor)
+        val buffer = ByteBuffer.allocate(MTU)
 
-            try {
-                while (!Thread.interrupted()) {
-                    val length = inputStream.read(packet.array())
-                    if (length > 0) {
-                        // Logic for TCP forwarding to sandbox goes here.
-                        // You would typically parse the IP packet, then the TCP segment,
-                        // and use a Socket to forward the payload.
-                        Log.d(TAG, "Received packet: $length bytes")
-                        
-                        // For a real implementation, consider using a library like
-                        // 'tun2socks' or a Java-based TCP/IP stack.
+        try {
+            while (isRunning) {
+                val readLength = input.read(buffer.array())
+                if (readLength > 0) {
+                    buffer.limit(readLength)
+                    // Process packet in a separate thread to keep the TUN interface clear
+                    val packetCopy = ByteBuffer.allocate(readLength)
+                    packetCopy.put(buffer.array(), 0, readLength)
+                    packetCopy.flip()
+                    
+                    executorService.execute { 
+                        processPacket(packetCopy, output) 
                     }
-                    packet.clear()
+                    buffer.clear()
                 }
-            } catch (e: IOException) {
-                Log.e(TAG, "Error in VPN loop", e)
-            } finally {
-                stopVpn()
             }
+        } catch (e: Exception) {
+            if (isRunning) Log.e(TAG, "VPN Loop Error", e)
+        } finally {
+            stopVpn()
         }
     }
 
-    private fun stopVpn() {
-        try {
-            vpnInterface?.close()
-        } catch (e: IOException) {
-            Log.e(TAG, "Error closing VPN interface", e)
+    private fun processPacket(buffer: ByteBuffer, output: FileOutputStream) {
+        val protocol = buffer.get(9).toInt() and 0xFF
+        val destIp = getIpAddress(buffer, 16)
+
+        if (protocol == 6) { // TCP
+            handleTcpPacket(buffer, destIp, output)
+        } else {
+            // Log.v(TAG, "Dropping non-TCP packet to $destIp")
         }
+    }
+
+    private fun handleTcpPacket(buffer: ByteBuffer, destIp: String, output: FileOutputStream) {
+        val sourcePort = getPort(buffer, 20)
+        val destPort = getPort(buffer, 22)
+        val sessionKey = "$sourcePort:$destIp:$destPort"
+
+        // Check if we have an active relay for this session
+        if (!tcpSessions.containsKey(sessionKey)) {
+            initiateRelay(sessionKey, destIp, destPort)
+        }
+        
+        // In a real implementation, we would extract the TCP payload here 
+        // and send it through the SocketChannel. For the "Expressive" demo,
+        // we log the interception and 'touch' the gateway.
+        Log.d(TAG, "Relaying $sessionKey to Sandbox Gateway ($GATEWAY_IP)")
+    }
+
+    private fun initiateRelay(key: String, destIp: String, destPort: Int) {
+        try {
+            val tunnel = SocketChannel.open()
+            // CRITICAL: Protect the socket so it doesn't loop back into the VPN
+            protect(tunnel.socket()) 
+            
+            tunnel.configureBlocking(false)
+            // Forwarding all traffic to the sandbox gateway
+            tunnel.connect(InetSocketAddress(GATEWAY_IP, 8080)) 
+            
+            tcpSessions[key] = tunnel
+            Log.i(TAG, "Started relay for $key")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start relay for $destIp", e)
+        }
+    }
+
+    private fun getIpAddress(buffer: ByteBuffer, offset: Int): String {
+        return "${buffer.get(offset).toInt() and 0xFF}.${buffer.get(offset + 1).toInt() and 0xFF}." +
+                "${buffer.get(offset + 2).toInt() and 0xFF}.${buffer.get(offset + 3).toInt() and 0xFF}"
+    }
+
+    private fun getPort(buffer: ByteBuffer, offset: Int): Int {
+        return ((buffer.get(offset).toInt() and 0xFF) shl 8) or (buffer.get(offset + 1).toInt() and 0xFF)
+    }
+
+    private fun stopVpn() {
+        isRunning = false
+        tcpSessions.values.forEach { try { it.close() } catch (e: Exception) {} }
+        tcpSessions.clear()
+        vpnInterface?.close()
         vpnInterface = null
-        executorService?.shutdownNow()
-        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        stopVpn()
+        isRunning = false
+        executorService.shutdownNow()
         super.onDestroy()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "VPN Status",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun createNotification(): Notification {
-        val stopIntent = Intent(this, LocalVpnService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("VPN Tunnel Active")
-            .setContentText("Forwarding TCP traffic to sandbox")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
     }
 }
